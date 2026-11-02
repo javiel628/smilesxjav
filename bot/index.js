@@ -944,6 +944,10 @@ async function connectToWA() {
 
 // Close the message handler and WhatsApp connection function.
 
+  } // End event handler loop
+} // End handleIncomingMessage
+} // End connectToWA
+
 setTimeout(() => {
   connectToWA().catch(err => {
     console.error('JAVIEL startup failed:', err.message);
