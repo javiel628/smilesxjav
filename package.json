@@ -13,7 +13,7 @@
     "check": "node --check platform/src/server.js && node --check platform/src/pairing.js && node --check platform/workers/deployment-worker.js && node --check bot/index.js"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "npm:@fizzxydev/baileys-pro@8.5.12",
+    "@whiskeysockets/baileys": "^7.0.0-rc.9",
     "@adiwajshing/keyed-db": "^0.2.4",
     "@dark-yasiya/yt-dl.js": "1.0.5",
     "@ffmpeg-installer/ffmpeg": "^1.1.0",
