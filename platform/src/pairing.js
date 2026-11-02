@@ -1,4 +1,3 @@
-
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
@@ -65,6 +64,86 @@ function safeError(err) {
     'PAIRING_FAILED',
     'Could not complete WhatsApp pairing. Please try again later.'
   ];
+}
+
+// All authentication saves are serialized through this queue.
+function queueAuthSave(entry, pool, sessionId, saveCreds = null) {
+  const task = entry.authSaveQueue
+    .catch(() => {})
+    .then(async () => {
+      if (entry.closed) return;
+
+      if (saveCreds) {
+        await saveCreds();
+      }
+
+      if (entry.closed) return;
+
+      await saveSessionSnapshot(pool, sessionId, entry.dir);
+    });
+
+  entry.authSaveQueue = task;
+
+  return task;
+}
+
+// Safely stop the socket, wait for pending saves, then delete files.
+async function disposeEntry(entry, removeFiles = true) {
+  if (entry.cleanupPromise) {
+    return entry.cleanupPromise;
+  }
+
+  entry.closed = true;
+
+  if (entry.timer) clearTimeout(entry.timer);
+  if (entry.requestTimer) clearTimeout(entry.requestTimer);
+  if (entry.reconnectTimer) clearTimeout(entry.reconnectTimer);
+
+  if (entry.snapshotTimer) {
+    clearInterval(entry.snapshotTimer);
+  }
+
+  entry.cleanupPromise = (async () => {
+    try {
+      entry.socket?.end(undefined);
+    } catch (error) {
+      console.error(
+        '[PAIRING_CLEANUP]',
+        entry.id,
+        error.message
+      );
+    }
+
+    if (active.get(entry.id) === entry) {
+      active.delete(entry.id);
+    }
+
+    // Never delete the auth directory while a save is running.
+    await entry.authSaveQueue.catch(error => {
+      console.error(
+        '[PAIRING_FINAL_SAVE]',
+        entry.id,
+        error.message
+      );
+    });
+
+    if (removeFiles && entry.dir) {
+      await fs.rm(entry.dir, {
+        recursive: true,
+        force: true,
+        maxRetries: 5,
+        retryDelay: 200
+      }).catch(error => {
+        console.error(
+          '[PAIRING_FILE_CLEANUP]',
+          entry.id,
+          error.message
+        );
+      });
+    }
+  })();
+
+  return entry.cleanupPromise;
 }
 
 async function startPairing(pool, userId, phoneInput) {
@@ -174,6 +253,7 @@ async function startPairing(pool, userId, phoneInput) {
   }
 
   const entry = {
+    id,
     dir,
     socket: null,
     timer: null,
@@ -185,7 +265,9 @@ async function startPairing(pool, userId, phoneInput) {
     reconnecting: false,
     restartCount: 0,
     saved: false,
-    closed: false
+    closed: false,
+    cleanupPromise: null,
+    authSaveQueue: Promise.resolve()
   };
 
   active.set(id, entry);
@@ -194,45 +276,8 @@ async function startPairing(pool, userId, phoneInput) {
   let saveCreds;
   let version;
 
-  // Keep credential writes in order so a restart does not
-  // happen before updated credentials have been saved.
-  let credsSaveQueue = Promise.resolve();
-
-  function cleanup(removeFiles = true) {
-    if (entry.closed) return;
-
-    entry.closed = true;
-
-    if (entry.timer) clearTimeout(entry.timer);
-    if (entry.requestTimer) clearTimeout(entry.requestTimer);
-    if (entry.reconnectTimer) clearTimeout(entry.reconnectTimer);
-
-    if (entry.snapshotTimer) {
-      clearInterval(entry.snapshotTimer);
-    }
-
-    try {
-      entry.socket?.end(undefined);
-    } catch (error) {
-      console.error('[PAIRING_CLEANUP]', id, error.message);
-    }
-
-    if (active.get(id) === entry) {
-      active.delete(id);
-    }
-
-    if (removeFiles) {
-      fs.rm(dir, {
-        recursive: true,
-        force: true
-      }).catch(error => {
-        console.error(
-          '[PAIRING_FILE_CLEANUP]',
-          id,
-          error.message
-        );
-      });
-    }
+  async function cleanup(removeFiles = true) {
+    return disposeEntry(entry, removeFiles);
   }
 
   async function failSession(error, label = 'PAIRING_ERROR') {
@@ -266,7 +311,7 @@ async function startPairing(pool, userId, phoneInput) {
       );
     });
 
-    cleanup(true);
+    await cleanup(true);
   }
 
   async function requestPairingCode(sock) {
@@ -292,7 +337,9 @@ async function startPairing(pool, userId, phoneInput) {
       if (entry.closed) return;
 
       if (!code) {
-        throw new Error('WhatsApp returned an empty pairing code.');
+        throw new Error(
+          'WhatsApp returned an empty pairing code.'
+        );
       }
 
       await pool.query(
@@ -319,17 +366,22 @@ async function startPairing(pool, userId, phoneInput) {
         'Pairing code generated successfully'
       );
 
+      // Periodic snapshots use the same serialized queue.
       entry.snapshotTimer = setInterval(() => {
-        if (entry.closed) return;
+        if (entry.closed || entry.saved) return;
 
-        saveSessionSnapshot(pool, id, dir).catch(error => {
+        queueAuthSave(
+          entry,
+          pool,
+          id
+        ).catch(error => {
           console.error(
             '[PAIRING_SNAPSHOT]',
             id,
             error.message
           );
         });
-      }, 2000);
+      }, 5000);
 
     } catch (error) {
       await failSession(error, 'PAIRING_CODE_ERROR');
@@ -346,16 +398,19 @@ async function startPairing(pool, userId, phoneInput) {
         'WhatsApp connection opened'
       );
 
-      await credsSaveQueue;
+      // Save credentials and snapshot in one queued operation.
+      await queueAuthSave(
+        entry,
+        pool,
+        id,
+        saveCreds
+      );
 
       if (entry.closed || entry.saved) return;
 
-      await saveCreds();
-      await saveSessionSnapshot(pool, id, dir);
-
       const publicId = newSessionId();
 
-      await pool.query(
+      const result = await pool.query(
         `
         UPDATE sessions
         SET public_id=$1,
@@ -365,9 +420,16 @@ async function startPairing(pool, userId, phoneInput) {
             error_message=NULL,
             updated_at=NOW()
         WHERE id=$2
+        AND status!='saved'
         `,
         [publicId, id]
       );
+
+      if (!result.rowCount) {
+        throw new Error(
+          'Could not mark the WhatsApp session as saved.'
+        );
+      }
 
       entry.saved = true;
 
@@ -393,7 +455,7 @@ async function startPairing(pool, userId, phoneInput) {
         );
       });
 
-      cleanup(true);
+      await cleanup(true);
 
     } catch (error) {
       await failSession(error, 'PAIRING_SAVE_ERROR');
@@ -401,15 +463,18 @@ async function startPairing(pool, userId, phoneInput) {
   }
 
   async function reconnectSocket() {
-    if (entry.closed || entry.saved || entry.reconnecting) {
+    if (
+      entry.closed ||
+      entry.saved ||
+      entry.reconnecting
+    ) {
       return;
     }
 
     entry.reconnecting = true;
 
     try {
-      // Wait until the latest credentials have been written.
-      await credsSaveQueue;
+      await entry.authSaveQueue;
 
       if (entry.closed || entry.saved) return;
 
@@ -420,8 +485,12 @@ async function startPairing(pool, userId, phoneInput) {
       );
 
       await createSocket();
+
     } catch (error) {
-      await failSession(error, 'PAIRING_RECONNECT_ERROR');
+      await failSession(
+        error,
+        'PAIRING_RECONNECT_ERROR'
+      );
     } finally {
       entry.reconnecting = false;
     }
@@ -456,25 +525,20 @@ async function startPairing(pool, userId, phoneInput) {
     }
 
     sock.ev.on('creds.update', () => {
-      if (entry.closed) return;
+      if (entry.closed || entry.saved) return;
 
-      credsSaveQueue = credsSaveQueue
-        .then(async () => {
-          if (entry.closed) return;
-
-          await saveCreds();
-
-          if (!entry.closed) {
-            await saveSessionSnapshot(pool, id, dir);
-          }
-        })
-        .catch(error => {
-          console.error(
-            '[PAIRING_CREDS]',
-            id,
-            error.message
-          );
-        });
+      queueAuthSave(
+        entry,
+        pool,
+        id,
+        saveCreds
+      ).catch(error => {
+        console.error(
+          '[PAIRING_CREDS]',
+          id,
+          error.message
+        );
+      });
     });
 
     sock.ev.on('connection.update', async update => {
@@ -532,19 +596,20 @@ async function startPairing(pool, userId, phoneInput) {
             [id]
           ).catch(() => {});
 
-          cleanup(true);
+          await cleanup(true);
           return;
         }
 
-        // 515 means WhatsApp requires a socket restart.
-        // Keep the same authentication directory and reconnect.
+        // WhatsApp 515 requires a socket restart.
         if (
           statusCode === DisconnectReason.restartRequired &&
           entry.codeGenerated
         ) {
           if (entry.restartCount >= 4) {
             await failSession(
-              new Error('WhatsApp requested too many socket restarts.'),
+              new Error(
+                'WhatsApp requested too many socket restarts.'
+              ),
               'PAIRING_RESTART_LIMIT'
             );
             return;
@@ -578,7 +643,6 @@ async function startPairing(pool, userId, phoneInput) {
           return;
         }
 
-        // Other disconnects are not treated as successful pairing.
         await failSession(
           disconnectError || new Error(
             'WhatsApp disconnected before pairing was completed.'
@@ -664,7 +728,7 @@ async function startPairing(pool, userId, phoneInput) {
           [id]
         ).catch(() => {});
 
-        cleanup(true);
+        await cleanup(true);
       }, Math.max(0, expiresAt.getTime() - Date.now()));
 
     } catch (error) {
@@ -685,53 +749,28 @@ async function startPairing(pool, userId, phoneInput) {
   };
 }
 
-function cleanup(id, removeFiles = true) {
+// External cleanup function.
+async function cleanup(id, removeFiles = true) {
   const entry = active.get(id);
 
-  if (!entry || entry.closed) return;
+  if (!entry) return;
 
-  entry.closed = true;
-
-  if (entry.timer) clearTimeout(entry.timer);
-  if (entry.requestTimer) clearTimeout(entry.requestTimer);
-  if (entry.reconnectTimer) clearTimeout(entry.reconnectTimer);
-
-  if (entry.snapshotTimer) {
-    clearInterval(entry.snapshotTimer);
-  }
-
-  try {
-    entry.socket?.end(undefined);
-  } catch (error) {
-    console.error(
-      '[PAIRING_CLEANUP]',
-      id,
-      error.message
-    );
-  }
-
-  active.delete(id);
-
-  if (removeFiles) {
-    fs.rm(entry.dir, {
-      recursive: true,
-      force: true
-    }).catch(error => {
-      console.error(
-        '[PAIRING_FILE_CLEANUP]',
-        id,
-        error.message
-      );
-    });
-  }
+  return disposeEntry(entry, removeFiles);
 }
 
 async function cancelPairing(id) {
-  cleanup(id, true);
+  const entry = active.get(id);
+
+  if (!entry) return;
+
+  await cleanup(id, true);
+
+  await entry.authSaveQueue.catch(() => {});
 }
 
 module.exports = {
   startPairing,
   active,
+  cleanup,
   cancelPairing
 };
