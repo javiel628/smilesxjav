@@ -18,8 +18,6 @@ const P = require('pino');
 
 const active = new Map();
 
-const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
-
 const safeError = err => {
   const message = String(err?.message || 'Connection failed');
 
@@ -37,18 +35,56 @@ const safeError = err => {
     ];
   }
 
+  if (/connection closed|websocket.*closed/i.test(message)) {
+    return [
+      'WHATSAPP_DISCONNECTED',
+      'WhatsApp closed the connection. Please try again.'
+    ];
+  }
+
   return [
     'PAIRING_FAILED',
     'Could not complete WhatsApp pairing. Please try again later.'
   ];
 };
 
-async function startPairing(pool, userId, phoneInput) {
-  const parsed = parsePhoneNumberFromString(phoneInput);
+// Accepts +254712345678, 254712345678, or 0712345678.
+function normalizePhoneNumber(input) {
+  const raw = String(input || '').trim();
+
+  if (!raw) return null;
+
+  let normalized;
+
+  if (raw.startsWith('+')) {
+    normalized = raw;
+  } else {
+    const digits = raw.replace(/\D/g, '');
+
+    if (digits.startsWith('254')) {
+      normalized = `+${digits}`;
+    } else if (digits.startsWith('0')) {
+      normalized = `+254${digits.slice(1)}`;
+    } else {
+      normalized = `+254${digits}`;
+    }
+  }
+
+  const parsed = parsePhoneNumberFromString(normalized);
 
   if (!parsed || !parsed.isValid()) {
+    return null;
+  }
+
+  return parsed;
+}
+
+async function startPairing(pool, userId, phoneInput) {
+  const parsed = normalizePhoneNumber(phoneInput);
+
+  if (!parsed) {
     const error = new Error(
-      'Enter a valid international phone number including country code, for example +254712345678.'
+      'Enter a valid phone number, for example 254712345678 or +254712345678.'
     );
 
     error.status = 400;
@@ -58,7 +94,7 @@ async function startPairing(pool, userId, phoneInput) {
   }
 
   const phone = parsed.number;
-  const phoneNumber = parsed.number.replace(/\D/g, '');
+  const phoneNumber = phone.replace(/\D/g, '');
 
   await pool.query(`
     UPDATE sessions
@@ -272,23 +308,11 @@ async function startPairing(pool, userId, phoneInput) {
       console.log(
         '[PAIRING]',
         id,
-        'Waiting before requesting pairing code'
-      );
-
-      // Give the WhatsApp WebSocket time to initialize.
-      await sleep(3000);
-
-      if (entry.closed) return;
-
-      console.log(
-        '[PAIRING]',
-        id,
         'Requesting pairing code'
       );
 
-      const code = await sock.requestPairingCode(
-        phoneNumber
-      );
+      // Baileys pairing codes require the socket to initialize first.
+      const code = await sock.requestPairingCode(phoneNumber);
 
       if (entry.closed) return;
 
@@ -310,12 +334,14 @@ async function startPairing(pool, userId, phoneInput) {
         [code, id]
       );
 
+      if (entry.closed) return;
+
       entry.codeGenerated = true;
 
       console.log(
         '[PAIRING]',
         id,
-        'Pairing code generated'
+        'Pairing code generated successfully'
       );
 
       entry.snapshotTimer = setInterval(() => {
@@ -373,7 +399,7 @@ async function startPairing(pool, userId, phoneInput) {
 
       entry.socket = sock;
 
-      // Handle WebSocket errors to prevent unhandled error crashes.
+      // Prevent unhandled WebSocket error events.
       if (sock.ws && typeof sock.ws.on === 'function') {
         sock.ws.on('error', error => {
           console.error(
@@ -402,7 +428,6 @@ async function startPairing(pool, userId, phoneInput) {
         }
       });
 
-      // Register connection listener before requesting the code.
       sock.ev.on('connection.update', async update => {
         if (entry.closed) return;
 
@@ -417,18 +442,6 @@ async function startPairing(pool, userId, phoneInput) {
             id,
             'Connecting to WhatsApp'
           );
-        }
-
-        // QR indicates that the initial WhatsApp connection
-        // has progressed. Start pairing if not already started.
-        if (update.qr && !entry.requestStarted) {
-          requestPairingCode(sock).catch(error => {
-            console.error(
-              '[PAIRING_REQUEST_HANDLER]',
-              id,
-              error.message
-            );
-          });
         }
 
         if (connection === 'open') {
@@ -507,9 +520,7 @@ async function startPairing(pool, userId, phoneInput) {
             entry.codeGenerated
           );
 
-          if (
-            statusCode === DisconnectReason.loggedOut
-          ) {
+          if (statusCode === DisconnectReason.loggedOut) {
             await pool.query(
               `
               UPDATE sessions
@@ -565,9 +576,10 @@ async function startPairing(pool, userId, phoneInput) {
         [id]
       );
 
-      // Some Baileys builds do not emit a QR event in pairing-code
-      // mode. Use a delayed fallback if no QR event arrives.
+      // Request once after the socket has had time to initialize.
       entry.requestTimer = setTimeout(() => {
+        entry.requestTimer = null;
+
         requestPairingCode(sock).catch(error => {
           console.error(
             '[PAIRING_REQUEST_HANDLER]',
@@ -575,7 +587,7 @@ async function startPairing(pool, userId, phoneInput) {
             error.message
           );
         });
-      }, 5000);
+      }, 3000);
 
       // Expire the pairing request even if no code is generated.
       entry.timer = setTimeout(async () => {
@@ -602,7 +614,6 @@ async function startPairing(pool, userId, phoneInput) {
         ).catch(() => {});
 
         cleanup(true);
-
       }, Math.max(0, expiresAt.getTime() - Date.now()));
 
     } catch (error) {
@@ -664,18 +675,7 @@ function cleanup(id, removeFiles = true) {
 }
 
 async function cancelPairing(id) {
-  const entry = active.get(id);
-
-  if (!entry) return;
-
-  await poolSafeCancel(id);
   cleanup(id, true);
-}
-
-async function poolSafeCancel(id) {
-  // Session cancellation is handled by the server endpoint.
-  // This helper intentionally does not modify database state.
-  return id;
 }
 
 module.exports = {
