@@ -18,7 +18,9 @@ const P = require('pino');
 
 const active = new Map();
 
-const safeError = (err) => {
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+const safeError = err => {
   const message = String(err?.message || 'Connection failed');
 
   if (/timeout/i.test(message)) {
@@ -56,6 +58,7 @@ async function startPairing(pool, userId, phoneInput) {
   }
 
   const phone = parsed.number;
+  const phoneNumber = parsed.number.replace(/\D/g, '');
 
   await pool.query(`
     UPDATE sessions
@@ -102,9 +105,12 @@ async function startPairing(pool, userId, phoneInput) {
 
   const id = newId();
 
+  const ttlMinutes = Number(
+    process.env.PAIRING_TTL_MINUTES || 10
+  );
+
   const expiresAt = new Date(
-    Date.now() +
-    Number(process.env.PAIRING_TTL_MINUTES || 10) * 60000
+    Date.now() + ttlMinutes * 60000
   );
 
   try {
@@ -136,17 +142,38 @@ async function startPairing(pool, userId, phoneInput) {
     throw err;
   }
 
-  const dir = await fs.mkdtemp(
-    path.join(os.tmpdir(), 'javiel-pair-')
-  );
+  let dir;
 
-  await fs.chmod(dir, 0o700);
+  try {
+    dir = await fs.mkdtemp(
+      path.join(os.tmpdir(), 'javiel-pair-')
+    );
+
+    await fs.chmod(dir, 0o700);
+  } catch (error) {
+    await pool.query(
+      `
+      UPDATE sessions
+      SET status='failed',
+          error_code='PAIRING_STORAGE_ERROR',
+          error_message='Could not initialize temporary session storage.',
+          updated_at=NOW()
+      WHERE id=$1
+      `,
+      [id]
+    ).catch(() => {});
+
+    throw error;
+  }
 
   const entry = {
     dir,
     socket: null,
     timer: null,
     snapshotTimer: null,
+    requestTimer: null,
+    requestStarted: false,
+    codeGenerated: false,
     closed: false
   };
 
@@ -157,16 +184,25 @@ async function startPairing(pool, userId, phoneInput) {
 
     entry.closed = true;
 
-    if (entry.timer) clearTimeout(entry.timer);
+    if (entry.timer) {
+      clearTimeout(entry.timer);
+      entry.timer = null;
+    }
+
+    if (entry.requestTimer) {
+      clearTimeout(entry.requestTimer);
+      entry.requestTimer = null;
+    }
 
     if (entry.snapshotTimer) {
       clearInterval(entry.snapshotTimer);
+      entry.snapshotTimer = null;
     }
 
     try {
       entry.socket?.end(undefined);
     } catch (error) {
-      console.error('[PAIRING_CLEANUP]', error.message);
+      console.error('[PAIRING_CLEANUP]', id, error.message);
     }
 
     if (active.get(id) === entry) {
@@ -178,20 +214,149 @@ async function startPairing(pool, userId, phoneInput) {
         recursive: true,
         force: true
       }).catch(error => {
-        console.error('[PAIRING_FILE_CLEANUP]', error.message);
+        console.error(
+          '[PAIRING_FILE_CLEANUP]',
+          id,
+          error.message
+        );
       });
+    }
+  }
+
+  async function failSession(error, label = 'PAIRING_ERROR') {
+    if (entry.closed) return;
+
+    console.error(
+      `[${label}]`,
+      id,
+      error?.stack || error?.message || error
+    );
+
+    const [errorCode, message] = safeError(error);
+
+    await pool.query(
+      `
+      UPDATE sessions
+      SET status='failed',
+          pairing_code=NULL,
+          error_code=$1,
+          error_message=$2,
+          updated_at=NOW()
+      WHERE id=$3
+      AND status!='saved'
+      `,
+      [errorCode, message, id]
+    ).catch(dbError => {
+      console.error(
+        '[PAIRING_DATABASE_ERROR]',
+        id,
+        dbError.message
+      );
+    });
+
+    cleanup(true);
+  }
+
+  async function requestPairingCode(sock) {
+    if (
+      entry.closed ||
+      entry.requestStarted ||
+      entry.codeGenerated
+    ) {
+      return;
+    }
+
+    entry.requestStarted = true;
+
+    try {
+      console.log(
+        '[PAIRING]',
+        id,
+        'Waiting before requesting pairing code'
+      );
+
+      // Give the WhatsApp WebSocket time to initialize.
+      await sleep(3000);
+
+      if (entry.closed) return;
+
+      console.log(
+        '[PAIRING]',
+        id,
+        'Requesting pairing code'
+      );
+
+      const code = await sock.requestPairingCode(
+        phoneNumber
+      );
+
+      if (entry.closed) return;
+
+      if (!code) {
+        throw new Error('WhatsApp returned an empty pairing code.');
+      }
+
+      await pool.query(
+        `
+        UPDATE sessions
+        SET pairing_code=$1,
+            status='waiting_verification',
+            error_code=NULL,
+            error_message=NULL,
+            updated_at=NOW()
+        WHERE id=$2
+        AND status!='saved'
+        `,
+        [code, id]
+      );
+
+      entry.codeGenerated = true;
+
+      console.log(
+        '[PAIRING]',
+        id,
+        'Pairing code generated'
+      );
+
+      entry.snapshotTimer = setInterval(() => {
+        if (entry.closed) return;
+
+        saveSessionSnapshot(pool, id, dir).catch(error => {
+          console.error(
+            '[PAIRING_SNAPSHOT]',
+            id,
+            error.message
+          );
+        });
+      }, 2000);
+
+    } catch (error) {
+      await failSession(error, 'PAIRING_CODE_ERROR');
     }
   }
 
   (async () => {
     try {
-      console.log('[PAIRING]', id, 'Initializing WhatsApp connection');
+      console.log(
+        '[PAIRING]',
+        id,
+        'Initializing WhatsApp connection'
+      );
 
       const { state, saveCreds } =
         await useMultiFileAuthState(dir);
 
+      if (entry.closed) return;
+
       const { version } =
         await fetchLatestBaileysVersion();
+
+      console.log(
+        '[PAIRING]',
+        id,
+        'Using WhatsApp Web version',
+        version
+      );
 
       const sock = makeWASocket({
         auth: state,
@@ -201,34 +366,78 @@ async function startPairing(pool, userId, phoneInput) {
         browser: Browsers.macOS('Firefox'),
         connectTimeoutMs: 60000,
         defaultQueryTimeoutMs: 60000,
-        keepAliveIntervalMs: 15000
+        keepAliveIntervalMs: 15000,
+        markOnlineOnConnect: false,
+        syncFullHistory: false
       });
 
       entry.socket = sock;
 
+      // Handle WebSocket errors to prevent unhandled error crashes.
+      if (sock.ws && typeof sock.ws.on === 'function') {
+        sock.ws.on('error', error => {
+          console.error(
+            '[PAIRING_WEBSOCKET_ERROR]',
+            id,
+            error.message
+          );
+        });
+      }
+
       sock.ev.on('creds.update', async () => {
+        if (entry.closed) return;
+
         try {
           await saveCreds();
-          await saveSessionSnapshot(pool, id, dir);
+
+          if (!entry.closed) {
+            await saveSessionSnapshot(pool, id, dir);
+          }
         } catch (error) {
-          console.error('[PAIRING_CREDS]', error.message);
+          console.error(
+            '[PAIRING_CREDS]',
+            id,
+            error.message
+          );
         }
       });
 
-      // Register connection listener BEFORE requesting pairing code.
-      sock.ev.on('connection.update', async ({
-        connection,
-        lastDisconnect
-      }) => {
+      // Register connection listener before requesting the code.
+      sock.ev.on('connection.update', async update => {
         if (entry.closed) return;
 
+        const {
+          connection,
+          lastDisconnect
+        } = update;
+
         if (connection === 'connecting') {
-          console.log('[PAIRING]', id, 'Connecting to WhatsApp');
+          console.log(
+            '[PAIRING]',
+            id,
+            'Connecting to WhatsApp'
+          );
+        }
+
+        // QR indicates that the initial WhatsApp connection
+        // has progressed. Start pairing if not already started.
+        if (update.qr && !entry.requestStarted) {
+          requestPairingCode(sock).catch(error => {
+            console.error(
+              '[PAIRING_REQUEST_HANDLER]',
+              id,
+              error.message
+            );
+          });
         }
 
         if (connection === 'open') {
           try {
-            console.log('[PAIRING]', id, 'WhatsApp connected');
+            console.log(
+              '[PAIRING]',
+              id,
+              'WhatsApp connected'
+            );
 
             await saveCreds();
             await saveSessionSnapshot(pool, id, dir);
@@ -249,7 +458,12 @@ async function startPairing(pool, userId, phoneInput) {
               [publicId, id]
             );
 
-            // Best-effort delivery of the session reference.
+            console.log(
+              '[PAIRING]',
+              id,
+              'Session saved'
+            );
+
             await sock.sendMessage(
               sock.user.id,
               {
@@ -261,6 +475,7 @@ async function startPairing(pool, userId, phoneInput) {
             ).catch(error => {
               console.error(
                 '[PAIRING_MESSAGE]',
+                id,
                 error.message
               );
             });
@@ -268,43 +483,33 @@ async function startPairing(pool, userId, phoneInput) {
             cleanup(true);
 
           } catch (error) {
-            console.error(
-              '[PAIRING_SAVE_ERROR]',
-              error
+            await failSession(
+              error,
+              'PAIRING_SAVE_ERROR'
             );
-
-            const [errorCode, message] = safeError(error);
-
-            await pool.query(
-              `
-              UPDATE sessions
-              SET status='failed',
-                  pairing_code=NULL,
-                  error_code=$1,
-                  error_message=$2,
-                  updated_at=NOW()
-              WHERE id=$3
-              `,
-              [errorCode, message, id]
-            ).catch(() => {});
-
-            cleanup(true);
           }
         }
 
         if (connection === 'close') {
+          const disconnectError = lastDisconnect?.error;
+
           const statusCode =
-            lastDisconnect?.error?.output?.statusCode;
+            disconnectError?.output?.statusCode;
 
           console.error(
             '[PAIRING_DISCONNECTED]',
             id,
             'Status:',
             statusCode || 'unknown',
-            lastDisconnect?.error?.message || ''
+            'Message:',
+            disconnectError?.message || 'No message',
+            'Code generated:',
+            entry.codeGenerated
           );
 
-          if (statusCode === DisconnectReason.loggedOut) {
+          if (
+            statusCode === DisconnectReason.loggedOut
+          ) {
             await pool.query(
               `
               UPDATE sessions
@@ -313,7 +518,34 @@ async function startPairing(pool, userId, phoneInput) {
                   error_code='WHATSAPP_LOGGED_OUT',
                   error_message='WhatsApp logged out before the session was saved.',
                   updated_at=NOW()
-              WHERE id=$1 AND status!='saved'
+              WHERE id=$1
+              AND status!='saved'
+              `,
+              [id]
+            ).catch(() => {});
+
+            cleanup(true);
+            return;
+          }
+
+          if (!entry.codeGenerated) {
+            await failSession(
+              disconnectError || new Error(
+                'WhatsApp closed the connection before generating a pairing code.'
+              ),
+              'PAIRING_DISCONNECTED_ERROR'
+            );
+          } else {
+            await pool.query(
+              `
+              UPDATE sessions
+              SET status='failed',
+                  pairing_code=NULL,
+                  error_code='WHATSAPP_DISCONNECTED',
+                  error_message='WhatsApp disconnected before pairing was completed. Start a new request.',
+                  updated_at=NOW()
+              WHERE id=$1
+              AND status!='saved'
               `,
               [id]
             ).catch(() => {});
@@ -333,38 +565,27 @@ async function startPairing(pool, userId, phoneInput) {
         [id]
       );
 
-      console.log('[PAIRING]', id, 'Requesting pairing code');
-
-      const code = await sock.requestPairingCode(
-        parsed.number.replace('+', '')
-      );
-
-      if (entry.closed) return;
-
-      await pool.query(
-        `
-        UPDATE sessions
-        SET pairing_code=$1,
-            status='waiting_verification',
-            updated_at=NOW()
-        WHERE id=$2
-        `,
-        [code, id]
-      );
-
-      console.log('[PAIRING]', id, 'Pairing code generated');
-
-      entry.snapshotTimer = setInterval(() => {
-        saveSessionSnapshot(pool, id, dir).catch(error => {
+      // Some Baileys builds do not emit a QR event in pairing-code
+      // mode. Use a delayed fallback if no QR event arrives.
+      entry.requestTimer = setTimeout(() => {
+        requestPairingCode(sock).catch(error => {
           console.error(
-            '[PAIRING_SNAPSHOT]',
+            '[PAIRING_REQUEST_HANDLER]',
+            id,
             error.message
           );
         });
-      }, 2000);
+      }, 5000);
 
+      // Expire the pairing request even if no code is generated.
       entry.timer = setTimeout(async () => {
-        console.log('[PAIRING]', id, 'Pairing expired');
+        if (entry.closed) return;
+
+        console.log(
+          '[PAIRING]',
+          id,
+          'Pairing expired'
+        );
 
         await pool.query(
           `
@@ -374,7 +595,8 @@ async function startPairing(pool, userId, phoneInput) {
               error_code='PAIRING_EXPIRED',
               error_message='Pairing code expired. Start a new request.',
               updated_at=NOW()
-          WHERE id=$1 AND status!='saved'
+          WHERE id=$1
+          AND status!='saved'
           `,
           [id]
         ).catch(() => {});
@@ -384,35 +606,15 @@ async function startPairing(pool, userId, phoneInput) {
       }, Math.max(0, expiresAt.getTime() - Date.now()));
 
     } catch (error) {
-      console.error(
-        '[PAIRING_ERROR]',
-        id,
-        error?.stack || error?.message || error
-      );
-
-      const [errorCode, message] = safeError(error);
-
-      await pool.query(
-        `
-        UPDATE sessions
-        SET status='failed',
-            pairing_code=NULL,
-            error_code=$1,
-            error_message=$2,
-            updated_at=NOW()
-        WHERE id=$3 AND status!='saved'
-        `,
-        [errorCode, message, id]
-      ).catch(dbError => {
-        console.error(
-          '[PAIRING_DATABASE_ERROR]',
-          dbError.message
-        );
-      });
-
-      cleanup(true);
+      await failSession(error);
     }
-  })();
+  })().catch(error => {
+    console.error(
+      '[PAIRING_UNHANDLED]',
+      id,
+      error?.stack || error
+    );
+  });
 
   return {
     id,
@@ -429,6 +631,7 @@ function cleanup(id, removeFiles = true) {
   entry.closed = true;
 
   if (entry.timer) clearTimeout(entry.timer);
+  if (entry.requestTimer) clearTimeout(entry.requestTimer);
 
   if (entry.snapshotTimer) {
     clearInterval(entry.snapshotTimer);
@@ -437,7 +640,11 @@ function cleanup(id, removeFiles = true) {
   try {
     entry.socket?.end(undefined);
   } catch (error) {
-    console.error('[PAIRING_CLEANUP]', error.message);
+    console.error(
+      '[PAIRING_CLEANUP]',
+      id,
+      error.message
+    );
   }
 
   active.delete(id);
@@ -446,12 +653,29 @@ function cleanup(id, removeFiles = true) {
     fs.rm(entry.dir, {
       recursive: true,
       force: true
-    }).catch(() => {});
+    }).catch(error => {
+      console.error(
+        '[PAIRING_FILE_CLEANUP]',
+        id,
+        error.message
+      );
+    });
   }
 }
 
 async function cancelPairing(id) {
+  const entry = active.get(id);
+
+  if (!entry) return;
+
+  await poolSafeCancel(id);
   cleanup(id, true);
+}
+
+async function poolSafeCancel(id) {
+  // Session cancellation is handled by the server endpoint.
+  // This helper intentionally does not modify database state.
+  return id;
 }
 
 module.exports = {
